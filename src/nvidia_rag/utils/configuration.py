@@ -94,12 +94,14 @@ class NvIngestConfig(ConfigWizard):
     # NV-Ingest Runtime Connectivity Configuration parameters
     message_client_hostname: str = configfield(
         "message_client_hostname",
+        env_name="APP_NV_INGEST_MESSAGE_CLIENT_HOSTNAME",
         default="localhost",  # TODO
         help_txt="NV Ingest Message Client Host Name",
     )
 
     message_client_port: int = configfield(
         "message_client_port",
+        env_name="APP_NV_INGEST_MESSAGE_CLIENT_PORT",
         default=7670,
         help_txt="NV Ingest Message Client Port",
     )
@@ -713,7 +715,7 @@ class AppConfig(ConfigWizard):
     )
     nv_ingest: NvIngestConfig = configfield(
         "nv_ingest",
-        env=False,
+        env=True,
         help_txt="The configuration for nv-ingest.",
         default=NvIngestConfig(),
     )

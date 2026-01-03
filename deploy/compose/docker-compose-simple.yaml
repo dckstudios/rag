@@ -1,0 +1,231 @@
+version: '3.8'
+
+services:
+  # Vector Database - Milvus (CPU version)
+  milvus-etcd:
+    container_name: milvus-etcd
+    image: quay.io/coreos/etcd:v3.6.5
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - milvus-etcd:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    profiles: ["", "milvus"]
+    networks:
+      - nvidia-rag
+
+  milvus-minio:
+    container_name: milvus-minio
+    image: minio/minio:latest
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    volumes:
+      - milvus-minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    ports:
+      - "9010:9000"
+      - "9001:9001"
+    depends_on:
+      - milvus-etcd
+    profiles: ["", "milvus"]
+    networks:
+      - nvidia-rag
+
+  milvus:
+    container_name: milvus-standalone
+    image: milvusdb/milvus:v2.4.11  # Stable version with better performance
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    volumes:
+      - milvus:/var/lib/milvus
+    ports:
+      - "19530:19530"
+      - "19091:9091"
+    depends_on:
+      - milvus-etcd
+      - milvus-minio
+    profiles: ["", "milvus"]
+    networks:
+      - nvidia-rag
+
+  # Redis cache
+  redis:
+    container_name: compose-redis-1
+    image: redis:7.0-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - nvidia-rag
+
+  # RAG Server - Uses Cloud NIMs
+  rag-server:
+    container_name: rag-server
+    image: nvcr.io/nvidia/blueprint/rag-server:2.3.0
+    build:
+      context: ../../
+      dockerfile: src/nvidia_rag/rag_server/Dockerfile
+    command: --port 8081 --host 0.0.0.0 --workers 4
+    environment:
+      # API Keys
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      NGC_API_KEY: ${NGC_API_KEY}
+
+      # Vector DB
+      APP_VECTORSTORE_URL: http://milvus:19530
+      APP_VECTORSTORE_NAME: milvus
+      COLLECTION_NAME: multimodal_data
+      APP_VECTORSTORE_ENABLEGPUSEARCH: "False"
+      APP_VECTORSTORE_ENABLEGPUINDEX: "False"
+
+      # LLM - Cloud NIMs
+      APP_LLM_MODELNAME: nvidia/llama-3.3-nemotron-super-49b-v1.5
+      APP_LLM_SERVERURL: https://ai.api.nvidia.com/v1/chat/completions
+      LLM_MAX_TOKENS: 1024
+      LLM_TEMPERATURE: 0
+      LLM_TOP_P: 1.0
+
+      # Embeddings - Cloud NIMs
+      APP_EMBEDDINGS_SERVERURL: https://ai.api.nvidia.com/v1/embedding/nvidia/nv-embedqa-e5-v5
+      APP_EMBEDDINGS_MODELNAME: nvidia/nv-embedqa-e5-v5
+
+      # Reranker - Cloud NIMs
+      APP_RANKING_SERVERURL: https://ai.api.nvidia.com/v1/ranking/nvidia/nv-reranker-qa-v2
+      APP_RANKING_MODELNAME: nvidia/nv-reranker-qa-v2
+      ENABLE_RERANKER: "True"
+
+      # Redis
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - milvus
+      - redis
+    networks:
+      - nvidia-rag
+
+  # Ingestor Server - Document ingestion
+  ingestor-server:
+    container_name: ingestor-server
+    image: nvcr.io/nvidia/blueprint/nv-ingest-server:25.9.0
+    build:
+      context: ../../
+      dockerfile: src/nvidia_rag/ingestor_server/Dockerfile
+    command: --port 8082 --host 0.0.0.0
+    environment:
+      # API Keys
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      NGC_API_KEY: ${NGC_API_KEY}
+
+      # Vector DB
+      APP_VECTORSTORE_URL: http://milvus:19530
+      COLLECTION_NAME: multimodal_data
+
+      # Embeddings - Cloud NIMs
+      APP_EMBEDDINGS_SERVERURL: https://ai.api.nvidia.com/v1/embedding/nvidia/nv-embedqa-e5-v5
+      APP_EMBEDDINGS_MODELNAME: nvidia/nv-embedqa-e5-v5
+
+      # MinIO
+      MINIO_ENDPOINT: milvus-minio:9000
+      MINIO_ACCESSKEY: minioadmin
+      MINIO_SECRETKEY: minioadmin
+
+      # Redis - Use Docker service name
+      REDIS_HOST: "redis"
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      REDIS_URL: "redis://redis:6379"
+      
+      # NV-Ingest configuration
+      APP_NV_INGEST_MESSAGE_CLIENT_HOSTNAME: "nv-ingest-ms-runtime"
+      APP_NV_INGEST_MESSAGE_CLIENT_PORT: "7670"
+    ports:
+      - "8082:8082"
+    depends_on:
+      - milvus
+      - redis
+      - nv-ingest-ms-runtime
+    networks:
+      - nvidia-rag
+
+  # NV-Ingest Runtime - Document processing service
+  nv-ingest-ms-runtime:
+    container_name: nv-ingest-ms-runtime
+    image: nvcr.io/nvidia/nemo-microservices/nv-ingest:25.9.0
+    ports:
+      # HTTP API
+      - "7670:7670"
+      # Simple Broker
+      - "7671:7671"
+    volumes:
+      - ./data:/workspace/data
+    environment:
+      # API Keys
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      NGC_API_KEY: ${NGC_API_KEY}
+
+      # Message client configuration - Using Redis
+      MESSAGE_CLIENT_HOST: redis
+      MESSAGE_CLIENT_PORT: 6379
+      MESSAGE_CLIENT_TYPE: redis
+      REDIS_MORPHEUS_TASK_QUEUE: morpheus_task_queue
+      
+      # MinIO configuration
+      MINIO_BUCKET: nv-ingest
+      
+      # Memory and processing
+      MAX_INGEST_PROCESS_WORKERS: 4
+      INGEST_LOG_LEVEL: WARNING
+      INGEST_RAY_LOG_LEVEL: PRODUCTION
+      INGEST_DISABLE_DYNAMIC_SCALING: "True"
+      
+      # Health check
+      READY_CHECK_ALL_COMPONENTS: "False"
+      
+      # Ray configuration
+      MRC_IGNORE_NUMA_CHECK: 1
+      
+      # Disable audio extraction for simplified deployment
+      INSTALL_AUDIO_EXTRACTION_DEPS: "false"
+      
+      # OCR endpoints (using Cloud NIMs)
+      OCR_HTTP_ENDPOINT: "https://ai.api.nvidia.com/v1/cv/baidu/paddleocr"
+      OCR_INFER_PROTOCOL: "http"
+      OCR_MODEL_NAME: "paddle"
+      
+      # YOLOX endpoints (using Cloud NIMs)
+      YOLOX_HTTP_ENDPOINT: "https://ai.api.nvidia.com/v1/cv/nvidia/nemoretriever-page-elements-v2"
+      YOLOX_INFER_PROTOCOL: "http"
+      
+      # YOLOX Graphics elements (using Cloud NIMs)
+      YOLOX_GRAPHIC_ELEMENTS_HTTP_ENDPOINT: "https://ai.api.nvidia.com/v1/cv/nvidia/nemoretriever-graphic-elements-v1"
+      YOLOX_GRAPHIC_ELEMENTS_INFER_PROTOCOL: "http"
+      
+      # YOLOX Table structure (using Cloud NIMs)
+      YOLOX_TABLE_STRUCTURE_HTTP_ENDPOINT: "https://ai.api.nvidia.com/v1/cv/nvidia/nemoretriever-table-structure-v1"
+      YOLOX_TABLE_STRUCTURE_INFER_PROTOCOL: "http"
+    depends_on:
+      - redis
+      - milvus
+    networks:
+      - nvidia-rag
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7670/v1/health/ready"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  milvus-etcd:
+  milvus-minio:
+  milvus:
+
+networks:
+  nvidia-rag:
+    driver: bridge

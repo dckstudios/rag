@@ -80,3 +80,5 @@ coverage/
 cover/
 *.log
 # Workbench Project Layout
+/.npm-cache
+/frontend/.npm-cache
